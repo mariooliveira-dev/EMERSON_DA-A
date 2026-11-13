@@ -14,10 +14,19 @@ const STORAGE_BUCKET = "portfolio-emerson";
 const LS_URL_KEY = "emerson_supabase_url";
 const LS_ANON_KEY = "emerson_supabase_anon_key";
 
+const DEFAULT_PUBLIC_SUPABASE_CONFIG = {
+  url: "https://czzivpdfjycgjswpxvhh.supabase.co",
+  anonKey: "sb_publishable_LBHFRHCibnh-oN--k-JU8Q_g8Md6uW_"
+};
+
 const AppState = {
   supabase: null,
+  anonSupabase: null,
   supabaseUrl: "",
   supabaseAnonKey: "",
+  credentialsSource: "none",
+  credentialsFromEnv: false,
+  serverConfig: null,
   secretKeyDetected: false,
   session: null,
   authSubscription: null,
@@ -26,6 +35,7 @@ const AppState = {
   adminMediaItems: [],
   uploadedFilesQueue: [],
   identityState: {},
+  identityStorageErrors: [],
   pendingIdentitySlotKey: null,
   isLoadingPublic: false
 };
@@ -109,19 +119,69 @@ function isSecretSupabaseKey(key) {
   return false;
 }
 
+async function hydratePublicSupabaseConfig() {
+  try {
+    const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), 2500) : null;
+    const res = await fetch("/api/public-config", {
+      method: "GET",
+      cache: "no-store",
+      signal: controller ? controller.signal : undefined
+    });
+    if (timer) clearTimeout(timer);
+    if (!res.ok) return;
+    const data = await res.json();
+    if (data && data.configured && data.url && data.anonKey && !isSecretSupabaseKey(data.anonKey)) {
+      AppState.serverConfig = {
+        url: String(data.url).trim().replace(/\/+$/, ""),
+        anonKey: String(data.anonKey).trim(),
+        source: data.source || "server-file"
+      };
+    }
+  } catch (_) {
+    // Fallback silencioso caso o servidor de API não esteja ativo (build estático puro)
+  }
+}
+
+async function syncPublicConfigToServer(url, anonKey, accessToken = "") {
+  if (!url || !anonKey || isSecretSupabaseKey(anonKey)) return false;
+  try {
+    const headers = { "Content-Type": "application/json" };
+    if (accessToken) {
+      headers.Authorization = `Bearer ${accessToken}`;
+    }
+    const res = await fetch("/api/public-config", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ url, anonKey })
+    });
+    if (res.ok) {
+      const payload = await res.json().catch(() => ({}));
+      AppState.serverConfig = {
+        url,
+        anonKey,
+        source: payload.source || "server-file"
+      };
+      AppState.credentialsSource = AppState.serverConfig.source;
+      AppState.credentialsFromEnv = AppState.serverConfig.source === "env";
+      return true;
+    }
+  } catch (_) {
+    // Ignora caso esteja rodando sem backend Express
+  }
+  return false;
+}
+
 function resolveSupabaseCredentials() {
   AppState.secretKeyDetected = false;
 
-  const envUrl =
-    (typeof import.meta !== "undefined" && import.meta.env && (import.meta.env.VITE_SUPABASE_URL || import.meta.env.SUPABASE_URL)) ||
-    "";
-  let envAnonKey =
-    (typeof import.meta !== "undefined" && import.meta.env && (import.meta.env.VITE_SUPABASE_ANON_KEY || import.meta.env.SUPABASE_ANON_KEY)) ||
-    "";
-
-  if (isSecretSupabaseKey(envAnonKey)) {
-    AppState.secretKeyDetected = true;
-    envAnonKey = "";
+  if (AppState.serverConfig && AppState.serverConfig.url && AppState.serverConfig.anonKey) {
+    return {
+      url: AppState.serverConfig.url,
+      anonKey: AppState.serverConfig.anonKey,
+      fromEnv: AppState.serverConfig.source === "env",
+      source: AppState.serverConfig.source || "server-file"
+    };
   }
 
   const savedUrl = localStorage.getItem(LS_URL_KEY) || "";
@@ -133,18 +193,96 @@ function resolveSupabaseCredentials() {
     savedAnonKey = "";
   }
 
+  const cleanUrl = savedUrl.trim().replace(/\/+$/, "");
+  const cleanKey = savedAnonKey.trim();
+
+  if (cleanUrl && cleanKey) {
+    return {
+      url: cleanUrl,
+      anonKey: cleanKey,
+      fromEnv: false,
+      source: "local"
+    };
+  }
+
   return {
-    url: (envUrl || savedUrl).trim().replace(/\/+$/, ""),
-    anonKey: (envAnonKey || savedAnonKey).trim(),
-    fromEnv: Boolean(envUrl && envAnonKey)
+    url: DEFAULT_PUBLIC_SUPABASE_CONFIG.url,
+    anonKey: DEFAULT_PUBLIC_SUPABASE_CONFIG.anonKey,
+    fromEnv: false,
+    source: "default"
   };
 }
 
+function createAnonymousSupabaseClient() {
+  if (!AppState.supabaseUrl || !AppState.supabaseAnonKey) return null;
+  if (AppState.anonSupabase) {
+    return AppState.anonSupabase;
+  }
+  AppState.anonSupabase = createClient(AppState.supabaseUrl, AppState.supabaseAnonKey, {
+    auth: {
+      persistSession: false,
+      autoRefreshToken: false,
+      detectSessionInUrl: false,
+      storageKey: "emerson-public-anon-readonly"
+    }
+  });
+  return AppState.anonSupabase;
+}
+
+function normalizePublicStorageUrl(rawUrl) {
+  if (!rawUrl || typeof rawUrl !== "string") return "";
+  const trimmed = rawUrl.trim();
+  if (!trimmed) return "";
+
+  if (trimmed.startsWith("data:") || trimmed.startsWith("blob:") || trimmed.startsWith("/src/") || trimmed.startsWith("/assets/")) {
+    return trimmed;
+  }
+
+  // Converte URLs antigas /authenticated/, /sign/ ou caminhos relativos do bucket para a URL pública canônica
+  const extractedPath = extractStoragePathFromUrl(trimmed);
+  if (extractedPath && AppState.supabase) {
+    const { data } = AppState.supabase.storage.from(STORAGE_BUCKET).getPublicUrl(extractedPath);
+    if (data && data.publicUrl) return data.publicUrl;
+  }
+
+  if (!/^https?:\/\//i.test(trimmed) && AppState.supabase) {
+    const cleanRel = trimmed.replace(/^\/+/, "");
+    const relWithoutBucket = cleanRel.startsWith(`${STORAGE_BUCKET}/`)
+      ? cleanRel.slice(STORAGE_BUCKET.length + 1)
+      : cleanRel;
+    const { data } = AppState.supabase.storage.from(STORAGE_BUCKET).getPublicUrl(relWithoutBucket);
+    if (data && data.publicUrl) return data.publicUrl;
+  }
+
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol === "http:" && AppState.supabaseUrl.startsWith("https://") && trimmed.includes("supabase")) {
+      parsed.protocol = "https:";
+    }
+    parsed.pathname = parsed.pathname
+      .split("/")
+      .map((seg) => {
+        if (!seg) return seg;
+        try {
+          return encodeURIComponent(decodeURIComponent(seg));
+        } catch (_) {
+          return encodeURIComponent(seg);
+        }
+      })
+      .join("/");
+    return parsed.toString();
+  } catch (_) {
+    return trimmed;
+  }
+}
+
 function initSupabaseClient() {
-  const { url, anonKey, fromEnv } = resolveSupabaseCredentials();
+  const { url, anonKey, fromEnv, source } = resolveSupabaseCredentials();
   AppState.supabaseUrl = url;
   AppState.supabaseAnonKey = anonKey;
   AppState.credentialsFromEnv = fromEnv;
+  AppState.credentialsSource = source;
+  AppState.anonSupabase = null;
 
   if (AppState.secretKeyDetected && !anonKey) {
     showToast(
@@ -287,7 +425,8 @@ async function loadPublicGallery() {
   `;
 
   try {
-    const { data, error } = await AppState.supabase
+    const publicClient = createAnonymousSupabaseClient() || AppState.supabase;
+    const { data, error } = await publicClient
       .from("midias")
       .select("id, titulo, descricao, categoria, arquivo_url, tipo, data_publicacao, publicado")
       .eq("publicado", true)
@@ -297,7 +436,10 @@ async function loadPublicGallery() {
       throw error;
     }
 
-    AppState.publicMediaItems = data || [];
+    AppState.publicMediaItems = (data || []).map((item) => ({
+      ...item,
+      arquivo_url: normalizePublicStorageUrl(item.arquivo_url)
+    }));
   } catch (err) {
     console.error("Erro ao carregar galeria pública do Supabase:", err);
     AppState.publicMediaItems = [];
@@ -419,6 +561,27 @@ function renderPublicGallery() {
     })
     .join("");
 
+  container.querySelectorAll(".media-thumb-wrapper img, .media-thumb-wrapper video").forEach((mediaEl) => {
+    mediaEl.addEventListener("error", () => {
+      const failedSrc = mediaEl.getAttribute("src") || "";
+      console.error("Falha ao carregar mídia pública do Supabase Storage:", failedSrc);
+      const wrapper = mediaEl.closest(".media-thumb-wrapper");
+      if (!wrapper || wrapper.querySelector(".media-error-fallback")) return;
+      mediaEl.style.display = "none";
+      const fallback = document.createElement("div");
+      fallback.className = "media-error-fallback";
+      fallback.innerHTML = `
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+          <rect width="18" height="18" x="3" y="3" rx="2" ry="2"></rect>
+          <circle cx="9" cy="9" r="2"></circle>
+          <path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"></path>
+        </svg>
+        <span>Arquivo indisponível no Storage público</span>
+      `;
+      wrapper.appendChild(fallback);
+    });
+  });
+
   container.querySelectorAll("[data-media-id]").forEach((el) => {
     const openItem = () => handlePublicMediaClick(el.getAttribute("data-media-id"));
     el.addEventListener("click", openItem);
@@ -435,10 +598,11 @@ function handlePublicMediaClick(id) {
   const item = AppState.publicMediaItems.find((m) => m.id === id);
   if (!item) return;
 
+  const mediaUrl = normalizePublicStorageUrl(item.arquivo_url);
   if (item.tipo === "video") {
-    openVideoModal(item.arquivo_url, item.titulo);
+    openVideoModal(mediaUrl, item.titulo);
   } else {
-    openLightbox(item);
+    openLightbox({ ...item, arquivo_url: mediaUrl });
   }
 }
 
@@ -587,6 +751,9 @@ function setupAdminPanel() {
 
       localStorage.setItem(LS_URL_KEY, url);
       localStorage.setItem(LS_ANON_KEY, anonKey);
+
+      const accessToken = AppState.session?.access_token || "";
+      await syncPublicConfigToServer(url, anonKey, accessToken);
 
       initSupabaseClient();
       setupAuthListener();
@@ -774,11 +941,15 @@ async function syncAdminModalView() {
     if (AppState.credentialsFromEnv) {
       sourceDisplay.style.color = "#4ade80";
       sourceDisplay.textContent =
-        "Origem da conexão: Variáveis de ambiente (VITE_SUPABASE_*). Pronto para publicação — qualquer visitante verá a galeria e capas automaticamente.";
+        "Origem da conexão: Variáveis de ambiente (VITE_SUPABASE_*). Qualquer visitante anônimo e dispositivo carregam a galeria e capas automaticamente.";
+    } else if (AppState.credentialsSource === "server-file" || AppState.credentialsSource === "default") {
+      sourceDisplay.style.color = "#4ade80";
+      sourceDisplay.textContent =
+        "Origem da conexão: Configuração pública ativa para visitantes anônimos. A galeria e as capas são carregadas automaticamente sem login em qualquer navegador ou janela anônima.";
     } else {
       sourceDisplay.style.color = "var(--accent-gold)";
       sourceDisplay.textContent =
-        "Origem da conexão: Apenas localStorage deste navegador. Antes de publicar na internet, defina VITE_SUPABASE_URL e VITE_SUPABASE_ANON_KEY nas variáveis de ambiente/Secrets para que todos os dispositivos carreguem a galeria.";
+        "Origem da conexão: Apenas localStorage deste navegador. Visitantes em janela anônima não terão acesso até sincronizar no servidor ou configurar VITE_SUPABASE_URL e VITE_SUPABASE_ANON_KEY nos Secrets.";
     }
   }
 
@@ -1199,6 +1370,7 @@ async function loadAdminMediaList() {
     tbody.innerHTML = AppState.adminMediaItems
       .map((item) => {
         const isVideo = item.tipo === "video";
+        const mediaUrl = normalizePublicStorageUrl(item.arquivo_url);
         const statusBadge = item.publicado
           ? `<span class="admin-status-badge published">Publicado</span>`
           : `<span class="admin-status-badge hidden">Oculto</span>`;
@@ -1208,8 +1380,8 @@ async function loadAdminMediaList() {
             <td>
               ${
                 isVideo
-                  ? `<video src="${escapeHtml(item.arquivo_url)}" class="admin-thumb-mini" preload="metadata" muted></video>`
-                  : `<img src="${escapeHtml(item.arquivo_url)}" alt="${escapeHtml(item.titulo)}" class="admin-thumb-mini" loading="lazy" />`
+                  ? `<video src="${escapeHtml(mediaUrl)}" class="admin-thumb-mini" preload="metadata" muted></video>`
+                  : `<img src="${escapeHtml(mediaUrl)}" alt="${escapeHtml(item.titulo)}" class="admin-thumb-mini" loading="lazy" />`
               }
             </td>
             <td>
@@ -1345,31 +1517,57 @@ async function runPublicConnectionCheck() {
 
   resultEl.style.display = "block";
   resultEl.className = "validation-inline-status";
-  resultEl.textContent = "Verificando tabela public.midias e bucket portfolio-emerson...";
+  resultEl.textContent = "Testando acesso anônimo em public.midias, Storage list() e URLs públicas...";
   if (btn) btn.disabled = true;
 
   try {
-    const anonClient = createClient(AppState.supabaseUrl, AppState.supabaseAnonKey, {
-      auth: { persistSession: false, autoRefreshToken: false }
-    });
+    const anonClient = createAnonymousSupabaseClient();
+    if (!anonClient) throw new Error("Credenciais Supabase não configuradas.");
 
     const { data, error: dbErr } = await anonClient
       .from("midias")
-      .select("id, publicado")
+      .select("id, arquivo_url, publicado")
       .eq("publicado", true)
-      .limit(5);
+      .order("data_publicacao", { ascending: false })
+      .limit(10);
 
-    if (dbErr) throw new Error(`Tabela public.midias: ${dbErr.message}`);
+    if (dbErr) throw new Error(`Tabela public.midias (anon): ${dbErr.message}`);
 
-    const storageListRes = await fetch(
-      `${AppState.supabaseUrl}/storage/v1/object/public/${STORAGE_BUCKET}/__probe_nonexistent__`,
-      { method: "HEAD" }
-    );
-    const bucketReachable = storageListRes.status === 404 || storageListRes.status === 400 || storageListRes.ok;
+    const rows = data || [];
+    const sampleUrls = rows
+      .map((r) => normalizePublicStorageUrl(r.arquivo_url))
+      .filter(Boolean)
+      .slice(0, 3);
 
-    resultEl.className = "validation-inline-status ok";
-    resultEl.innerHTML =
-      `<strong>Conexão pública OK.</strong> Tabela <code>public.midias</code> acessível (${(data || []).length} item(ns) retornado(s)) e bucket <code>${STORAGE_BUCKET}</code> ${bucketReachable ? "respondendo" : `status ${storageListRes.status}`}. Faça login para testar RLS do administrador, upload e exclusão.`;
+    let failedHttp = [];
+    for (const url of sampleUrls) {
+      const res = await fetch(url, { method: "GET" }).catch(() => null);
+      if (!res || !res.ok) {
+        failedHttp.push(`${url} (HTTP ${res ? res.status : "rede"})`);
+      }
+    }
+
+    const { data: identityFiles, error: listErr } = await anonClient.storage
+      .from(STORAGE_BUCKET)
+      .list("identidade/hero", { limit: 5 });
+
+    const warnings = [];
+    if (failedHttp.length > 0) {
+      warnings.push(`Falha HTTP ao abrir arquivo(s) públicos: ${failedHttp[0]}`);
+    }
+    if (listErr) {
+      warnings.push(`Listagem anônima das capas (storage.objects SELECT) falhou: ${listErr.message}`);
+    }
+
+    if (warnings.length > 0) {
+      resultEl.className = "validation-inline-status fail";
+      resultEl.innerHTML = `<strong>Alerta para visitantes anônimos:</strong> ${escapeHtml(warnings.join(" | "))}`;
+    } else {
+      const coverCount = (identityFiles || []).filter((f) => f && f.name && !f.name.startsWith(".") && f.id !== null).length;
+      resultEl.className = "validation-inline-status ok";
+      resultEl.innerHTML =
+        `<strong>Acesso anônimo OK.</strong> <code>public.midias</code> retornou ${rows.length} item(ns) publicado(s), ${sampleUrls.length} URL(s) validada(s) com HTTP 200 e listagem de capas anônima ativa (${coverCount} arquivo(s) em <code>identidade/hero</code>).`;
+    }
   } catch (err) {
     resultEl.className = "validation-inline-status fail";
     resultEl.textContent = `Falha na verificação: ${err.message || err}`;
@@ -1451,21 +1649,31 @@ async function runFullSupabaseValidation() {
     const adminUid = activeSession.user.id;
     setStep(2, "pass", `Autenticado como ${activeSession.user.email} | UID: ${adminUid}`);
 
-    // 4. Leitura pública anônima (publicado = true)
-    const anonClient = createClient(AppState.supabaseUrl, AppState.supabaseAnonKey, {
-      auth: { persistSession: false, autoRefreshToken: false }
-    });
+    // 4. Leitura pública anônima (publicado = true + listagem anônima de capas + HTTP)
+    const anonClient = createAnonymousSupabaseClient();
     const { data: anonRows, error: anonErr } = await anonClient
       .from("midias")
-      .select("id, publicado");
+      .select("id, arquivo_url, publicado");
+    const { error: anonListErr } = await anonClient.storage
+      .from(STORAGE_BUCKET)
+      .list("identidade/hero", { limit: 1 });
+
     if (anonErr) {
       setStep(3, "fail", `Erro na leitura pública (anon): ${anonErr.message}`);
     } else {
       const leakedHidden = (anonRows || []).some((r) => r.publicado === false);
       if (leakedHidden) {
         setStep(3, "fail", "Atenção: cliente anônimo recebeu registro com publicado = false! Verifique a política SELECT.");
+      } else if (anonListErr) {
+        setStep(3, "fail", `public.midias OK, mas listagem anônima no Storage (storage.objects SELECT) falhou: ${anonListErr.message}`);
       } else {
-        setStep(3, "pass", `Leitura anônima OK: ${(anonRows || []).length} registro(s) público(s), nenhum item oculto exposto.`);
+        let httpNote = "";
+        if (anonRows && anonRows.length > 0 && anonRows[0].arquivo_url) {
+          const sampleUrl = normalizePublicStorageUrl(anonRows[0].arquivo_url);
+          const sampleRes = await fetch(sampleUrl, { method: "GET" }).catch(() => null);
+          httpNote = sampleRes && sampleRes.ok ? " | Arquivo público HTTP 200." : ` | Aviso HTTP ${sampleRes ? sampleRes.status : "rede"} em arquivo existente.`;
+        }
+        setStep(3, "pass", `Leitura anônima OK: ${(anonRows || []).length} registro(s) público(s), nenhum item oculto exposto e listagem anônima do Storage ativa${httpNote}`);
       }
     }
 
@@ -1648,21 +1856,33 @@ function applyIdentitySlotToDom(slot, url, posKey) {
   if (!imgEl) return;
 
   const preset = FRAMING_PRESETS[posKey] || FRAMING_PRESETS[slot.defaultPosKey] || FRAMING_PRESETS.center;
-  if (url) {
-    imgEl.src = url;
-  } else if (imgEl.dataset.defaultSrc) {
-    imgEl.src = imgEl.dataset.defaultSrc;
+  const resolvedUrl = url ? normalizePublicStorageUrl(url) : "";
+  const defaultSrc = imgEl.dataset.defaultSrc || "";
+
+  imgEl.onerror = () => {
+    if (resolvedUrl && imgEl.getAttribute("src") !== defaultSrc && defaultSrc) {
+      console.error(`Falha ao carregar capa "${slot.key}" (${resolvedUrl}). Revertendo para imagem padrão.`);
+      imgEl.onerror = null;
+      imgEl.src = defaultSrc;
+    }
+  };
+
+  if (resolvedUrl) {
+    imgEl.src = resolvedUrl;
+  } else if (defaultSrc) {
+    imgEl.src = defaultSrc;
   }
   imgEl.style.objectPosition = preset.css;
 
-  if (slot.key === "hero" && url) {
+  if (slot.key === "hero" && resolvedUrl) {
     const ogImage = document.querySelector('meta[property="og:image"]');
-    if (ogImage) ogImage.setAttribute("content", url);
+    if (ogImage) ogImage.setAttribute("content", resolvedUrl);
   }
 }
 
 async function loadSiteIdentityFromSupabase() {
   ensureDefaultIdentitySrcs();
+  AppState.identityStorageErrors = [];
 
   if (!AppState.supabase) {
     SITE_IDENTITY_SLOTS.forEach((slot) => {
@@ -1679,12 +1899,14 @@ async function loadSiteIdentityFromSupabase() {
     return;
   }
 
+  const publicClient = createAnonymousSupabaseClient() || AppState.supabase;
+
   await Promise.all(
     SITE_IDENTITY_SLOTS.map(async (slot) => {
       const imgEl = document.getElementById(slot.imgId);
       const defaultSrc = imgEl ? imgEl.dataset.defaultSrc : "";
       try {
-        const { data: files, error } = await AppState.supabase.storage
+        const { data: files, error } = await publicClient.storage
           .from(STORAGE_BUCKET)
           .list(`identidade/${slot.key}`, {
             limit: 10,
@@ -1701,11 +1923,11 @@ async function loadSiteIdentityFromSupabase() {
           const activeFile = validFiles[0];
           const storagePath = `identidade/${slot.key}/${activeFile.name}`;
           const posKey = parseFramingFromFileName(activeFile.name, slot.defaultPosKey);
-          const { data: urlData } = AppState.supabase.storage
+          const { data: urlData } = publicClient.storage
             .from(STORAGE_BUCKET)
             .getPublicUrl(storagePath);
 
-          const publicUrl = urlData ? urlData.publicUrl : defaultSrc;
+          const publicUrl = urlData ? normalizePublicStorageUrl(urlData.publicUrl) : defaultSrc;
           AppState.identityState[slot.key] = {
             isCustom: true,
             url: publicUrl,
@@ -1716,7 +1938,8 @@ async function loadSiteIdentityFromSupabase() {
           return;
         }
       } catch (err) {
-        console.warn(`Aviso ao carregar capa "${slot.key}" do Supabase:`, err);
+        AppState.identityStorageErrors.push({ slot: slot.key, message: err?.message || String(err) });
+        console.warn(`Aviso ao carregar capa "${slot.key}" do Supabase (anon):`, err);
       }
 
       AppState.identityState[slot.key] = {
@@ -2281,11 +2504,27 @@ document.addEventListener("DOMContentLoaded", async () => {
   setupGlobalModalClosers();
   setupAdminPanel();
 
+  await hydratePublicSupabaseConfig();
   const hasConfig = initSupabaseClient();
   if (hasConfig) {
     setupAuthListener();
-    const { data } = await AppState.supabase.auth.getSession();
-    AppState.session = data ? data.session : null;
+    try {
+      const { data } = await AppState.supabase.auth.getSession();
+      AppState.session = data ? data.session : null;
+    } catch (err) {
+      console.warn("Aviso ao verificar sessão local (seguindo como visitante anônimo):", err);
+      AppState.session = null;
+    }
+
+    // Se o navegador do administrador já tinha URL + Anon Key salvas apenas no localStorage,
+    // sincroniza automaticamente com o servidor para que visitantes anônimos também recebam.
+    if (AppState.credentialsSource === "local") {
+      await syncPublicConfigToServer(
+        AppState.supabaseUrl,
+        AppState.supabaseAnonKey,
+        AppState.session?.access_token || ""
+      );
+    }
   }
 
   await Promise.all([loadPublicGallery(), loadSiteIdentityFromSupabase()]);
